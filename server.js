@@ -377,8 +377,9 @@ function removePlayerCompletely(socketId, reason = 'desconexão') {
       // DESTRUIÇÃO AUTOMÁTICA DE SALAS VAZIAS
       if (room.players.length === 0) {
         if (room.qualiInterval) clearInterval(room.qualiInterval);
+        if (room.finishCountdownInterval) clearInterval(room.finishCountdownInterval);
         delete rooms[roomId];
-        console.log(`[SALA] removida por falta de jogadores: ${roomId}`);
+        console.log(`[SALA] removida automaticamente: ${roomId}`);
       } else {
         // TRANSFERÊNCIA DE HOST AUTOMÁTICA
         if (room.hostId === socketId) {
@@ -419,24 +420,24 @@ function removePlayerCompletely(socketId, reason = 'desconexão') {
   printServerDiagnostics();
 }
 
-// LIMPEZA AUTOMÁTICA DE JOGADORES INATIVOS (A cada 30 segundos)
-// Remove jogadores sem comunicação há mais de 20 segundos
+// LIMPEZA AUTOMÁTICA DE JOGADORES INATIVOS (A cada 3 segundos)
+// Remove jogadores sem comunicação / heartbeat há mais de 15 segundos
 setInterval(() => {
   const now = Date.now();
-  const TIMEOUT_MS = 20000;
+  const TIMEOUT_MS = 15000;
   let expiredCount = 0;
 
   for (const [socketId, p] of Object.entries(players)) {
-    const lastActive = p.lastActive || p.connectedAt || now;
+    const lastActive = p.lastSeen || p.lastActive || p.connectedAt || now;
     const elapsed = now - lastActive;
 
     if (elapsed > TIMEOUT_MS) {
-      console.log(`[SERVER] Jogador expirado por timeout: ${p.playerName} (${socketId}) - Inativo há ${(elapsed / 1000).toFixed(1)}s`);
+      console.log(`[SERVER] Jogador expirado por timeout (>15s): ${p.playerName} (${socketId}) - Inativo há ${(elapsed / 1000).toFixed(1)}s`);
       const clientSocket = io.sockets.sockets.get(socketId);
       if (clientSocket) {
         try { clientSocket.disconnect(true); } catch (e) {}
       }
-      removePlayerCompletely(socketId, 'timeout');
+      removePlayerCompletely(socketId, 'timeout / heartbeat perdido');
       expiredCount++;
     }
   }
@@ -444,7 +445,7 @@ setInterval(() => {
   if (expiredCount > 0) {
     printServerDiagnostics();
   }
-}, 30000);
+}, 3000);
 
 // ==========================================
 // SOCKET.IO EVENTOS E SINCRONIZAÇÃO
@@ -501,6 +502,15 @@ io.on('connection', (socket) => {
 
   // Envia histórico de chat recente
   socket.emit('chat:history', globalChatHistory.slice(-30));
+
+  // Heartbeat do Cliente (a cada 5s)
+  socket.on('heartbeat', (data) => {
+    if (players[socket.id]) {
+      const now = Date.now();
+      players[socket.id].lastSeen = now;
+      players[socket.id].lastActive = now;
+    }
+  });
 
   // Ping / Latência
   socket.on('client:ping', (timestamp) => {
@@ -1000,29 +1010,152 @@ io.on('connection', (socket) => {
         playerName: pInfo.playerName,
         kartNumber: pInfo.kartNumber,
         bestLapMs: data.bestLapMs || null,
-        totalTimeMs: data.totalTimeMs || null
+        totalTimeMs: data.totalTimeMs || null,
+        status: 'FINISHED'
       };
       room.finishedPlayers.push(finishEntry);
 
-      console.log(`[SERVER] Piloto completou a corrida: ${finishPos}º ${pInfo.playerName}`);
+      console.log(`[SERVER] Piloto completou a corrida: ${finishPos}º ${pInfo.playerName} (${pInfo.kartNumber})`);
 
       io.to(room.roomId).emit('playerFinishedRace', finishEntry);
 
-      // Se todos completaram, finaliza a corrida e atualiza estatísticas
-      if (room.finishedPlayers.length >= room.players.length) {
-        room.status = 'FINISHED';
-        console.log(`[SERVER] Corrida finalizada na sala ${room.roomName}!`);
-
-        const poleWinner = (room.gridOrder && room.gridOrder[0]) ? room.gridOrder[0].playerName : null;
-        recordRaceStatistics(room.finishedPlayers, poleWinner);
-
-        io.to(room.roomId).emit('raceAllFinished', {
-          roomId: room.roomId,
-          results: room.finishedPlayers
+      // 1. O PRIMEIRO JOGADOR COMPLETA TODAS AS VOLTAS (Líder finalizou)
+      if (room.finishedPlayers.length === 1) {
+        console.log(`[SERVER] 🏁 Líder finalizou na sala ${room.roomName}! Iniciando contagem regressiva de 30s.`);
+        room.finishCountdown = 30;
+        io.to(room.roomId).emit('race:leader_finished', {
+          leaderName: pInfo.playerName,
+          remainingSeconds: 30
         });
+
+        if (room.finishCountdownInterval) clearInterval(room.finishCountdownInterval);
+        room.finishCountdownInterval = setInterval(() => {
+          if (!rooms[room.roomId]) {
+            clearInterval(room.finishCountdownInterval);
+            return;
+          }
+          room.finishCountdown -= 1;
+          io.to(room.roomId).emit('race:finish_countdown_tick', {
+            remainingSeconds: Math.max(0, room.finishCountdown)
+          });
+
+          if (room.finishCountdown <= 0) {
+            clearInterval(room.finishCountdownInterval);
+            room.finishCountdownInterval = null;
+            concludeRace(room);
+          }
+        }, 1000);
+      }
+
+      // Se todos os jogadores completaram a corrida:
+      if (room.finishedPlayers.length >= room.players.length) {
+        if (room.finishCountdownInterval) {
+          clearInterval(room.finishCountdownInterval);
+          room.finishCountdownInterval = null;
+        }
+        concludeRace(room);
       }
     }
   });
+
+  // Função centralizada para finalização da corrida, montagem de resultados e retorno ao lobby
+  function concludeRace(room) {
+    if (room.status === 'FINISHED') return;
+    room.status = 'FINISHED';
+    if (room.finishCountdownInterval) {
+      clearInterval(room.finishCountdownInterval);
+      room.finishCountdownInterval = null;
+    }
+
+    console.log(`[SERVER] Corrida finalizada na sala ${room.roomName}! Montando resultados oficiais...`);
+
+    const leaderEntry = room.finishedPlayers[0];
+    const leaderTimeMs = leaderEntry ? leaderEntry.totalTimeMs : 0;
+
+    const finalResults = [];
+    room.finishedPlayers.forEach((fp, idx) => {
+      const deltaMs = (idx === 0 || !fp.totalTimeMs || !leaderTimeMs)
+        ? 0
+        : Math.max(0, fp.totalTimeMs - leaderTimeMs);
+      finalResults.push({
+        position: idx + 1,
+        playerId: fp.playerId,
+        playerName: fp.playerName,
+        kartNumber: fp.kartNumber,
+        bestLapMs: fp.bestLapMs,
+        totalTimeMs: fp.totalTimeMs,
+        deltaMs: deltaMs,
+        deltaFormatted: idx === 0 ? 'LÍDER' : `+${(deltaMs / 1000).toFixed(3)}s`,
+        status: 'FINISHED'
+      });
+    });
+
+    // Quem não finalizou a tempo recebe status DNF
+    const finishedIds = new Set(room.finishedPlayers.map((p) => p.playerId));
+    let nextPos = finalResults.length + 1;
+    room.players.forEach((p) => {
+      if (!finishedIds.has(p.playerId)) {
+        finalResults.push({
+          position: nextPos++,
+          playerId: p.playerId,
+          playerName: p.playerName,
+          kartNumber: p.kartNumber,
+          bestLapMs: p.bestLap || null,
+          totalTimeMs: null,
+          deltaMs: null,
+          deltaFormatted: 'DNF',
+          status: 'DNF'
+        });
+      }
+    });
+
+    // Encontra a melhor volta geral da corrida
+    let bestLapOverall = null;
+    finalResults.forEach((r) => {
+      if (r.bestLapMs && (!bestLapOverall || r.bestLapMs < bestLapOverall.bestLapMs)) {
+        bestLapOverall = {
+          playerName: r.playerName,
+          bestLapMs: r.bestLapMs
+        };
+      }
+    });
+
+    const poleWinner = (room.gridOrder && room.gridOrder[0]) ? room.gridOrder[0].playerName : null;
+    recordRaceStatistics(finalResults, poleWinner);
+
+    io.to(room.roomId).emit('raceAllFinished', {
+      roomId: room.roomId,
+      roomName: room.roomName,
+      totalLaps: room.config ? room.config.totalLaps : 5,
+      results: finalResults,
+      bestLapOverall
+    });
+
+    // 6. Aguarda 10 segundos na tela de resultados
+    // 7. Retorna todos os jogadores automaticamente para o Lobby da sala (mantendo a sala e jogadores intactos)
+    setTimeout(() => {
+      if (!rooms[room.roomId]) return;
+      console.log(`[SERVER] Retornando todos os jogadores ao lobby da sala ${room.roomName}...`);
+      room.status = 'WAITING';
+      room.finishedPlayers = [];
+      room.gridOrder = [];
+      room.players.forEach((p) => {
+        p.isReady = false;
+        p.currentLap = 1;
+      });
+
+      io.to(room.roomId).emit('race:return_to_lobby', {
+        roomId: room.roomId,
+        roomName: room.roomName,
+        hostId: room.hostId,
+        players: room.players,
+        config: room.config
+      });
+
+      io.emit('roomList', getPublicRooms());
+      io.emit('race:rooms_list', getPublicRooms());
+    }, 10000);
+  }
 
   // 6. SINCRONIZAÇÃO DE TELEMETRIA (playerState / playerUpdate a 20 Hz)
   const handlePlayerState = (state = {}) => {
