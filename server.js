@@ -170,8 +170,9 @@ app.post('/api/records', (req, res) => {
   res.json({ success: true, record: newEntry, rank: globalRecords.indexOf(newEntry) + 1 });
 });
 
-// 4. ENDPOINTS REST: ESTATÍSTICAS E PERFIL DO PILOTO
+// 4. ENDPOINTS REST: ESTATÍSTICAS E PERFIL DO PILOTO (RANKING GLOBAL)
 app.get('/api/statistics', (req, res) => {
+  const sortBy = req.query.sort || 'wins';
   const list = Object.values(globalStatistics).map((st) => {
     const finishes = st.finishPositions || [];
     const avgPos = finishes.length > 0
@@ -179,6 +180,7 @@ app.get('/api/statistics', (req, res) => {
       : '-';
     return {
       nome: st.nome,
+      favoriteNumber: st.favoriteNumber || 17,
       races: st.races || 0,
       wins: st.wins || 0,
       poles: st.poles || 0,
@@ -187,8 +189,19 @@ app.get('/api/statistics', (req, res) => {
       avgPosition: avgPos
     };
   });
-  list.sort((a, b) => b.wins - a.wins || b.podiums - a.podiums);
-  res.json(list);
+
+  if (sortBy === 'poles') {
+    list.sort((a, b) => b.poles - a.poles || b.wins - a.wins);
+  } else if (sortBy === 'races') {
+    list.sort((a, b) => b.races - a.races || b.wins - a.wins);
+  } else if (sortBy === 'bestLap') {
+    list.sort((a, b) => (a.bestLap || 999999) - (b.bestLap || 999999));
+  } else {
+    // Padrão: mais vitórias
+    list.sort((a, b) => b.wins - a.wins || b.podiums - a.podiums);
+  }
+
+  res.json(list.slice(0, 100));
 });
 
 app.get('/api/profile/:name', (req, res) => {
@@ -277,50 +290,18 @@ function getPublicRooms() {
       hasPassword: Boolean(r.password),
       status: r.status,
       config: r.config,
-      players: r.players.map((p) => ({
+      players: r.players.map((p, idx) => ({
         playerId: p.playerId,
         id: p.playerId,
         playerName: p.playerName,
-        kartNumber: p.kartNumber,
-        numberInt: p.numberInt,
+        favoriteNumber: p.favoriteNumber || 17,
+        kartNumber: p.kartNumber || '#17',
+        gridSlot: p.gridSlot || `P${idx + 1}`,
         isHost: p.isHost,
         isReady: p.isReady
       }))
     };
   });
-}
-
-function allocateGlobalKartNumber() {
-  const used = new Set(Object.values(players).map((p) => p.numberInt).filter(Boolean));
-  for (let i = 1; i <= 5; i++) {
-    if (!used.has(i)) return i;
-  }
-  return Object.keys(players).length + 1;
-}
-
-function allocateRoomKartNumber(room, isHost = false) {
-  if (isHost && !room.usedNumbers.includes(1)) {
-    room.usedNumbers.push(1);
-    return 1;
-  }
-  for (let n = 1; n <= room.maxPlayers; n++) {
-    if (!room.usedNumbers.includes(n)) {
-      room.usedNumbers.push(n);
-      return n;
-    }
-  }
-  const fallback = room.players.length + 1;
-  room.usedNumbers.push(fallback);
-  return fallback;
-}
-
-function releaseRoomKartNumber(room, numInt) {
-  if (room && numInt) {
-    const idx = room.usedNumbers.indexOf(numInt);
-    if (idx !== -1) {
-      room.usedNumbers.splice(idx, 1);
-    }
-  }
 }
 
 /**
@@ -354,18 +335,16 @@ function removePlayerCompletely(socketId, reason = 'desconexão') {
   const playerName = pInfo.playerName || 'Piloto';
   const kartNum = pInfo.kartNumber || '#?';
   const roomId = pInfo.roomId;
+  const mode = pInfo.mode;
 
-  console.log(`[SERVER] Jogador removido: ${socketId} (${playerName}) - Motivo: ${reason}`);
+  console.log(`[SERVER] Jogador removido: ${socketId} (${playerName} ${kartNum}) - Motivo: ${reason}`);
 
-  // Se o jogador estava registrado em alguma sala:
+  // Se o jogador estava registrado em alguma sala de corrida:
   if (roomId && rooms[roomId]) {
     const room = rooms[roomId];
     const idx = room.players.findIndex((p) => p.playerId === socketId);
     if (idx !== -1) {
-      const leaving = room.players[idx];
-      releaseRoomKartNumber(room, leaving.numberInt);
       room.players.splice(idx, 1);
-
       console.log(`[SERVER] Slot liberado: ${kartNum} na sala ${room.roomName}`);
       console.log(`[SERVER] Sala atualizada: ${roomId} (${room.players.length}/${room.maxPlayers})`);
 
@@ -402,50 +381,54 @@ function removePlayerCompletely(socketId, reason = 'desconexão') {
         io.to(roomId).emit('roomConfigUpdated', { config: room.config, players: room.players });
       }
     }
+  } else if (roomId === 'TIMETRIAL_ONLINE' || mode === 'ONLINE_TIMETRIAL') {
+    io.to('TIMETRIAL_ONLINE').emit('playerLeft', {
+      playerId: socketId,
+      playerName
+    });
+    const ttCount = Object.values(players).filter((p) => p.mode === 'ONLINE_TIMETRIAL' && p.playerId !== socketId).length;
+    io.to('TIMETRIAL_ONLINE').emit('onlineCount', ttCount);
   }
 
   // Remove da lista global de jogadores
   delete players[socketId];
 
   // Emite atualização autoritativa para TODOS os clientes em tempo real
-  const onlineCount = Object.keys(players).length;
-  io.emit('playerLeft', { playerId: socketId, playerName });
   io.emit('playerDisconnected', socketId);
-  io.emit('playersUpdate', players);
-  io.emit('players', players);
-  io.emit('onlineCount', onlineCount);
   io.emit('roomList', getPublicRooms());
   io.emit('race:rooms_list', getPublicRooms());
 
   printServerDiagnostics();
 }
 
-// LIMPEZA AUTOMÁTICA DE JOGADORES INATIVOS (A cada 3 segundos)
-// Remove jogadores sem comunicação / heartbeat há mais de 15 segundos
+// AUDITORIA AUTOMÁTICA DE INTEGRIDADE (A cada 10 segundos)
+// Valida se o socket ainda existe, responde heartbeat e está ativo. Remove automaticamente fantasmas.
 setInterval(() => {
   const now = Date.now();
   const TIMEOUT_MS = 15000;
-  let expiredCount = 0;
 
   for (const [socketId, p] of Object.entries(players)) {
+    const clientSocket = io.sockets.sockets.get(socketId);
     const lastActive = p.lastSeen || p.lastActive || p.connectedAt || now;
     const elapsed = now - lastActive;
 
-    if (elapsed > TIMEOUT_MS) {
-      console.log(`[SERVER] Jogador expirado por timeout (>15s): ${p.playerName} (${socketId}) - Inativo há ${(elapsed / 1000).toFixed(1)}s`);
-      const clientSocket = io.sockets.sockets.get(socketId);
+    if (!clientSocket || !clientSocket.connected || elapsed > TIMEOUT_MS) {
+      console.log(`[SERVER] Jogador expirado: ${p.playerName} ${p.kartNumber || ''} (${socketId}) - Inativo há ${(elapsed / 1000).toFixed(1)}s`);
       if (clientSocket) {
         try { clientSocket.disconnect(true); } catch (e) {}
       }
-      removePlayerCompletely(socketId, 'timeout / heartbeat perdido');
-      expiredCount++;
+      removePlayerCompletely(socketId, 'inativo / timeout / desconectado');
+      console.log(`[SERVER] Slot liberado`);
     }
   }
 
-  if (expiredCount > 0) {
-    printServerDiagnostics();
-  }
-}, 3000);
+  // Logs periódicos [DEBUG] exigidos na auditoria
+  const activePlayersList = Object.values(players).map(p => `- ${p.playerName} #${p.favoriteNumber || 17} (ID: ${p.socketId}) [Modo: ${p.mode || 'ONLINE'}]`);
+  const activeRoomsList = Object.values(rooms).map(r => `- ${r.roomName} (${r.roomId}) - ${r.players.length}/${r.maxPlayers} pilotos`);
+
+  console.log(`[DEBUG]\nPlayers ativos:\n${activePlayersList.length > 0 ? activePlayersList.join('\n') : 'Nenhum player ativo'}`);
+  console.log(`[DEBUG]\nSalas ativas:\n${activeRoomsList.length > 0 ? activeRoomsList.join('\n') : 'Nenhuma sala ativa'}`);
+}, 10000);
 
 // ==========================================
 // SOCKET.IO EVENTOS E SINCRONIZAÇÃO
@@ -453,29 +436,14 @@ setInterval(() => {
 io.on('connection', (socket) => {
   console.log(`[SERVER] Cliente conectado: ${socket.id}`);
 
-  const now = Date.now();
-  const numInt = allocateGlobalKartNumber();
-  const kartNumberStr = `#${numInt}`;
+  // IMPORTANTE: NÃO criar jogador no 'players' ao conectar!
+  // O registro de jogador é criado SOMENTE após confirmação de entrada em modo online
 
-  const playerObj = {
-    socketId: socket.id,
-    id: socket.id,
-    playerId: socket.id,
-    kartNumber: kartNumberStr,
-    numberInt: numInt,
-    playerName: `Piloto ${numInt}`,
-    roomId: null,
-    isHost: false,
-    isReady: false,
-    position: { x: 0, y: 0, z: 0 },
-    rotation: { heading: 0, steerAngle: 0 },
-    speed: 0,
-    currentLap: 1,
-    bestLap: null,
-    lastActive: now,
-    connectedAt: now
-  };
-  players[socket.id] = playerObj;
+  // Envia histórico de salas e chat para visualização nos menus
+  const publicRooms = getPublicRooms();
+  socket.emit('roomList', publicRooms);
+  socket.emit('race:rooms_list', publicRooms);
+  socket.emit('chat:history', globalChatHistory.slice(-30));
 
   // Intercepta qualquer evento para atualizar o heartbeat de atividade
   socket.onAny(() => {
@@ -483,25 +451,6 @@ io.on('connection', (socket) => {
       players[socket.id].lastActive = Date.now();
     }
   });
-
-  console.log(`[SERVER] emit playerAssigned: ${socket.id} (${kartNumberStr})`);
-  socket.emit('playerAssigned', playerObj);
-
-  const totalPlayers = Object.keys(players).length;
-  console.log(`[SERVER] emit playersUpdate: ${totalPlayers} pilotos online`);
-  io.emit('playersUpdate', players);
-  io.emit('players', players);
-  io.emit('onlineCount', totalPlayers);
-
-  printServerDiagnostics();
-
-  const publicRooms = getPublicRooms();
-  console.log(`[SERVER] emit roomList: ${publicRooms.length} salas`);
-  socket.emit('roomList', publicRooms);
-  socket.emit('race:rooms_list', publicRooms);
-
-  // Envia histórico de chat recente
-  socket.emit('chat:history', globalChatHistory.slice(-30));
 
   // Heartbeat do Cliente (a cada 5s)
   socket.on('heartbeat', (data) => {
@@ -539,9 +488,13 @@ io.on('connection', (socket) => {
   socket.on('roomList', sendRoomList);
   socket.on('race:list_rooms', sendRoomList);
 
-  // 2. CRIAR SALA (createRoom com CONFIGURAÇÃO COMPLETA)
+  // 2. CRIAR SALA (createRoom com PERFIL OFICIAL E CONFIGURAÇÃO COMPLETA)
   const handleCreateRoom = (data = {}) => {
-    const playerName = (data.playerName || players[socket.id].playerName || 'Piloto').slice(0, 22).trim();
+    const playerName = String(data.playerName || 'Piloto').slice(0, 22).trim() || 'Piloto';
+    const rawFav = parseInt(String(data.favoriteNumber || data.kartNumber || '17').replace('#', ''), 10);
+    const favNum = (rawFav >= 1 && rawFav <= 99) ? rawFav : 17;
+    const favNumStr = `#${favNum < 10 ? '0' + favNum : favNum}`;
+
     const rawName = (data.roomName || data.name || `RA-KART-${Math.floor(100 + Math.random() * 900)}`).slice(0, 26).trim();
     const maxPlayers = Math.min(5, Math.max(2, parseInt(data.maxPlayers, 10) || 5));
     const totalLaps = [1, 3, 5, 10, 15, 20].includes(Number(data.totalLaps)) ? Number(data.totalLaps) : 5;
@@ -553,7 +506,7 @@ io.on('connection', (socket) => {
     const kartWeight = Math.min(150, Math.max(40, Number(data.kartWeight) || 80));
 
     const roomId = `RA-KART-${Math.floor(100 + Math.random() * 900)}`;
-    console.log(`[SERVER] createRoom recebido: ${roomId} por ${socket.id} (${playerName})`);
+    console.log(`[SERVER] createRoom recebido: ${roomId} por ${socket.id} (${playerName} ${favNumStr})`);
 
     const roomConfig = {
       roomName: rawName,
@@ -566,6 +519,30 @@ io.on('connection', (socket) => {
       password
     };
 
+    const hostPlayer = {
+      socketId: socket.id,
+      id: socket.id,
+      playerId: socket.id,
+      playerName,
+      favoriteNumber: favNum,
+      kartNumber: favNumStr,
+      gridSlot: 'P1',
+      kartWeight,
+      avatar: data.avatar || '🏎️',
+      mode: 'ONLINE_RACE',
+      roomId: roomId,
+      isHost: true,
+      isReady: true,
+      position: { x: 0, y: 0, z: 0 },
+      rotation: { heading: 0, steerAngle: 0 },
+      speed: 0,
+      currentLap: 1,
+      bestLap: null,
+      lastSeen: Date.now(),
+      lastActive: Date.now(),
+      connectedAt: Date.now()
+    };
+
     const room = {
       roomId,
       roomName: rawName,
@@ -574,8 +551,7 @@ io.on('connection', (socket) => {
       password,
       config: roomConfig,
       status: 'WAITING',
-      players: [],
-      usedNumbers: [],
+      players: [hostPlayer],
       chatMessages: [],
       qualiLeaderboard: new Map(),
       qualiTimeRemaining: 0,
@@ -583,34 +559,8 @@ io.on('connection', (socket) => {
       finishedPlayers: []
     };
 
-    const hostNumberInt = allocateRoomKartNumber(room, true);
-    const hostNumberStr = `#${hostNumberInt}`;
-
-    const hostPlayer = {
-      socketId: socket.id,
-      id: socket.id,
-      playerId: socket.id,
-      playerName,
-      kartNumber: hostNumberStr,
-      numberInt: hostNumberInt,
-      kartWeight,
-      isHost: true,
-      isReady: true,
-      position: { x: 0, y: 0, z: 0 },
-      rotation: { heading: 0, steerAngle: 0 },
-      speed: 0,
-      currentLap: 1,
-      bestLap: null
-    };
-
-    room.players.push(hostPlayer);
     rooms[roomId] = room;
-
-    players[socket.id].roomId = roomId;
-    players[socket.id].kartNumber = hostNumberStr;
-    players[socket.id].numberInt = hostNumberInt;
-    players[socket.id].playerName = playerName;
-    players[socket.id].isHost = true;
+    players[socket.id] = hostPlayer;
 
     socket.join(roomId);
 
@@ -620,8 +570,10 @@ io.on('connection', (socket) => {
       hostId: socket.id,
       maxPlayers,
       isHost: true,
-      myKartNumber: hostNumberStr,
-      kartNumber: hostNumberStr,
+      myKartNumber: favNumStr,
+      kartNumber: favNumStr,
+      favoriteNumber: favNum,
+      gridSlot: 'P1',
       config: roomConfig,
       players: room.players
     };
@@ -632,8 +584,6 @@ io.on('connection', (socket) => {
     const updatedRooms = getPublicRooms();
     io.emit('roomList', updatedRooms);
     io.emit('race:rooms_list', updatedRooms);
-    io.emit('playersUpdate', players);
-    io.emit('players', players);
   };
   socket.on('createRoom', handleCreateRoom);
   socket.on('race:create_room', handleCreateRoom);
@@ -670,14 +620,17 @@ io.on('connection', (socket) => {
     io.emit('roomList', getPublicRooms());
   });
 
-  // 3. ENTRAR EM SALA (joinRoom)
+  // 3. ENTRAR EM SALA (joinRoom com PERFIL OFICIAL)
   const handleJoinRoom = (data = {}) => {
     const roomId = data.roomId || data.id;
-    const playerName = (data.playerName || players[socket.id].playerName || 'Piloto').slice(0, 22).trim();
+    const playerName = String(data.playerName || 'Piloto').slice(0, 22).trim() || 'Piloto';
+    const rawFav = parseInt(String(data.favoriteNumber || data.kartNumber || '17').replace('#', ''), 10);
+    const favNum = (rawFav >= 1 && rawFav <= 99) ? rawFav : 17;
+    const favNumStr = `#${favNum < 10 ? '0' + favNum : favNum}`;
     const password = (data.password || '').trim();
     const kartWeight = Math.min(150, Math.max(40, Number(data.kartWeight) || 80));
 
-    console.log(`[SERVER] joinRoom recebido: ${roomId} por ${socket.id} (${playerName})`);
+    console.log(`[SERVER] joinRoom recebido: ${roomId} por ${socket.id} (${playerName} ${favNumStr})`);
 
     const room = rooms[roomId];
     if (!room) {
@@ -697,32 +650,33 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const assignedNumberInt = allocateRoomKartNumber(room, false);
-    const assignedNumberStr = `#${assignedNumberInt}`;
-
+    const gridSlot = `P${room.players.length + 1}`;
     const newPlayer = {
       socketId: socket.id,
       id: socket.id,
       playerId: socket.id,
       playerName,
-      kartNumber: assignedNumberStr,
-      numberInt: assignedNumberInt,
+      favoriteNumber: favNum,
+      kartNumber: favNumStr,
+      gridSlot,
       kartWeight,
+      avatar: data.avatar || '🏎️',
+      mode: 'ONLINE_RACE',
+      roomId: roomId,
       isHost: false,
       isReady: false,
       position: { x: 0, y: 0, z: 0 },
       rotation: { heading: 0, steerAngle: 0 },
       speed: 0,
       currentLap: 1,
-      bestLap: null
+      bestLap: null,
+      lastSeen: Date.now(),
+      lastActive: Date.now(),
+      connectedAt: Date.now()
     };
 
     room.players.push(newPlayer);
-    players[socket.id].roomId = roomId;
-    players[socket.id].kartNumber = assignedNumberStr;
-    players[socket.id].numberInt = assignedNumberInt;
-    players[socket.id].playerName = playerName;
-    players[socket.id].isHost = false;
+    players[socket.id] = newPlayer;
 
     socket.join(roomId);
 
@@ -732,8 +686,10 @@ io.on('connection', (socket) => {
       hostId: room.hostId,
       maxPlayers: room.maxPlayers,
       isHost: false,
-      myKartNumber: assignedNumberStr,
-      kartNumber: assignedNumberStr,
+      myKartNumber: favNumStr,
+      kartNumber: favNumStr,
+      favoriteNumber: favNum,
+      gridSlot,
       config: room.config,
       players: room.players
     };
@@ -741,13 +697,11 @@ io.on('connection', (socket) => {
     socket.emit('roomJoined', roomPayload);
     socket.emit('playerJoined', { player: newPlayer, room: roomPayload, isSelf: true });
 
-    console.log(`[SERVER] emit playerJoined: ${socket.id} (${assignedNumberStr}) na sala ${roomId}`);
+    console.log(`[SERVER] emit playerJoined: ${socket.id} (${playerName} ${favNumStr}) na sala ${roomId}`);
     socket.to(roomId).emit('playerJoined', { player: newPlayer, room: roomPayload, isSelf: false });
 
     io.emit('roomList', getPublicRooms());
     io.emit('race:rooms_list', getPublicRooms());
-    io.emit('playersUpdate', players);
-    io.emit('players', players);
   };
   socket.on('joinRoom', handleJoinRoom);
   socket.on('race:join_room', handleJoinRoom);
@@ -1183,9 +1137,9 @@ io.on('connection', (socket) => {
       }
       socket.to(room.roomId).emit('playerState', state);
       socket.to(room.roomId).emit('playerUpdate', state);
-    } else {
-      socket.broadcast.emit('playerState', state);
-      socket.broadcast.emit('playerUpdate', state);
+    } else if (pInfo.roomId === 'TIMETRIAL_ONLINE' || pInfo.mode === 'ONLINE_TIMETRIAL') {
+      socket.to('TIMETRIAL_ONLINE').emit('playerState', state);
+      socket.to('TIMETRIAL_ONLINE').emit('playerUpdate', state);
     }
   };
   socket.on('playerState', handlePlayerState);
@@ -1239,58 +1193,7 @@ io.on('connection', (socket) => {
 
   // 8. SAÍDA DE SALA (leaveRoom)
   const handleLeaveRoom = () => {
-    const pInfo = players[socket.id];
-    if (!pInfo || !pInfo.roomId) return;
-
-    const roomId = pInfo.roomId;
-    const room = rooms[roomId];
-    if (room) {
-      const idx = room.players.findIndex((p) => p.playerId === socket.id);
-      if (idx !== -1) {
-        const leaving = room.players[idx];
-        releaseRoomKartNumber(room, leaving.numberInt);
-        room.players.splice(idx, 1);
-        if (room.qualiLeaderboard) room.qualiLeaderboard.delete(socket.id);
-        if (room.gridOrder) room.gridOrder = room.gridOrder.filter((g) => g.playerId !== socket.id);
-        if (room.finishedPlayers) room.finishedPlayers = room.finishedPlayers.filter((f) => f.playerId !== socket.id);
-
-        console.log(`[SERVER] Jogador saiu da sala: ${leaving.playerName} (${leaving.kartNumber})`);
-        console.log(`[SERVER] Slot liberado: ${leaving.kartNumber} na sala ${room.roomName}`);
-        console.log(`[SERVER] Sala atualizada: ${roomId} (${room.players.length}/${room.maxPlayers})`);
-
-        if (room.players.length === 0) {
-          if (room.qualiInterval) clearInterval(room.qualiInterval);
-          delete rooms[roomId];
-          console.log(`[SALA] removida por falta de jogadores: ${roomId}`);
-        } else {
-          if (room.hostId === socket.id) {
-            const nextHost = room.players[0];
-            room.hostId = nextHost.playerId;
-            nextHost.isHost = true;
-            nextHost.isReady = true;
-            console.log(`[SERVER] Novo Host: ${nextHost.playerName} na sala ${room.roomName}`);
-            io.to(roomId).emit('hostTransferred', {
-              newHostId: nextHost.playerId,
-              newHostName: nextHost.playerName
-            });
-          }
-          io.to(roomId).emit('playerLeft', {
-            playerId: socket.id,
-            playerName: leaving.playerName,
-            players: room.players
-          });
-          io.to(roomId).emit('roomConfigUpdated', { config: room.config, players: room.players });
-        }
-      }
-    }
-
-    socket.leave(roomId);
-    pInfo.roomId = null;
-    io.emit('roomList', getPublicRooms());
-    io.emit('race:rooms_list', getPublicRooms());
-    io.emit('playersUpdate', players);
-    io.emit('players', players);
-    io.emit('onlineCount', Object.keys(players).length);
+    removePlayerCompletely(socket.id, 'saída de sala');
   };
   socket.on('leaveRoom', handleLeaveRoom);
   socket.on('race:leave', handleLeaveRoom);
@@ -1304,14 +1207,66 @@ io.on('connection', (socket) => {
     removePlayerCompletely(socket.id, 'desconexão');
   });
 
-  // Time Trial Online
+  // Time Trial Online - Entrada e Saída
   socket.on('timetrial:join', (data = {}) => {
-    const pInfo = players[socket.id];
-    if (pInfo) {
-      if (data.playerName) pInfo.playerName = String(data.playerName).slice(0, 22).trim();
-      socket.emit('timetrial:joined', pInfo);
-      io.emit('playersUpdate', players);
-      io.emit('players', players);
+    const cleanName = String(data.playerName || 'Piloto').slice(0, 22).trim() || 'Piloto';
+    const rawFav = parseInt(String(data.favoriteNumber || data.kartNumber || '17').replace('#', ''), 10);
+    const favNum = (rawFav >= 1 && rawFav <= 99) ? rawFav : 17;
+    const favNumStr = `#${favNum < 10 ? '0' + favNum : favNum}`;
+    const kartWeight = Math.max(40, Math.min(150, Number(data.kartWeight) || 80));
+
+    const playerObj = {
+      socketId: socket.id,
+      id: socket.id,
+      playerId: socket.id,
+      playerName: cleanName,
+      favoriteNumber: favNum,
+      kartNumber: favNumStr,
+      kartWeight,
+      avatar: data.avatar || '🏎️',
+      mode: 'ONLINE_TIMETRIAL',
+      roomId: 'TIMETRIAL_ONLINE',
+      isHost: false,
+      isReady: true,
+      position: { x: 0, y: 0, z: 0 },
+      rotation: { heading: 0, steerAngle: 0 },
+      speed: 0,
+      currentLap: 1,
+      bestLap: null,
+      lastSeen: Date.now(),
+      lastActive: Date.now(),
+      connectedAt: Date.now()
+    };
+
+    players[socket.id] = playerObj;
+    socket.join('TIMETRIAL_ONLINE');
+
+    console.log(`[SERVER] Piloto cadastrado no Time Trial Online: ${cleanName} ${favNumStr} (${socket.id})`);
+
+    socket.emit('playerAssigned', playerObj);
+    socket.emit('timetrial:joined', playerObj);
+
+    // Envia ao novo jogador APENAS os pilotos que já estavam no Time Trial Online (excluindo ele mesmo)
+    const existingTT = Object.values(players).filter((p) => p.mode === 'ONLINE_TIMETRIAL' && p.playerId !== socket.id);
+    socket.emit('playersUpdate', existingTT);
+
+    // Transmite para os outros pilotos da sala que este jogador entrou
+    socket.to('TIMETRIAL_ONLINE').emit('playerJoined', playerObj);
+
+    // Atualiza contagem online de Time Trial
+    const totalTT = Object.values(players).filter((p) => p.mode === 'ONLINE_TIMETRIAL').length;
+    io.to('TIMETRIAL_ONLINE').emit('onlineCount', totalTT);
+  });
+
+  socket.on('timetrial:leave', () => {
+    if (players[socket.id] && players[socket.id].mode === 'ONLINE_TIMETRIAL') {
+      const p = players[socket.id];
+      console.log(`[SERVER] Piloto saiu do Time Trial: ${p.playerName} (${socket.id})`);
+      socket.leave('TIMETRIAL_ONLINE');
+      delete players[socket.id];
+      socket.to('TIMETRIAL_ONLINE').emit('playerLeft', { playerId: socket.id, playerName: p.playerName });
+      const totalTT = Object.values(players).filter((x) => x.mode === 'ONLINE_TIMETRIAL').length;
+      io.to('TIMETRIAL_ONLINE').emit('onlineCount', totalTT);
     }
   });
 
