@@ -323,12 +323,136 @@ function releaseRoomKartNumber(room, numInt) {
   }
 }
 
+/**
+ * DIAGNÓSTICO DO SERVIDOR
+ * Registra periodicamente e em eventos-chave:
+ * [SERVER] Players ativos:
+ * [SERVER] Salas ativas:
+ * [SERVER] Hosts ativos:
+ */
+function printServerDiagnostics() {
+  const pCount = Object.keys(players).length;
+  const rCount = Object.keys(rooms).length;
+  const hosts = Object.values(rooms).map((r) => {
+    const h = players[r.hostId];
+    return h ? `${h.playerName} (${r.roomName})` : r.hostId;
+  }).join(', ') || 'Nenhum';
+
+  console.log(`[SERVER] Players ativos: ${pCount}`);
+  console.log(`[SERVER] Salas ativas: ${rCount}`);
+  console.log(`[SERVER] Hosts ativos: ${hosts}`);
+}
+
+/**
+ * REMOÇÃO COMPLETA E IMEDIATA DE JOGADOR
+ * Executada em: disconnect, disconnecting, timeout, fechamento de aba
+ */
+function removePlayerCompletely(socketId, reason = 'desconexão') {
+  const pInfo = players[socketId];
+  if (!pInfo) return;
+
+  const playerName = pInfo.playerName || 'Piloto';
+  const kartNum = pInfo.kartNumber || '#?';
+  const roomId = pInfo.roomId;
+
+  console.log(`[SERVER] Jogador removido: ${socketId} (${playerName}) - Motivo: ${reason}`);
+
+  // Se o jogador estava registrado em alguma sala:
+  if (roomId && rooms[roomId]) {
+    const room = rooms[roomId];
+    const idx = room.players.findIndex((p) => p.playerId === socketId);
+    if (idx !== -1) {
+      const leaving = room.players[idx];
+      releaseRoomKartNumber(room, leaving.numberInt);
+      room.players.splice(idx, 1);
+
+      console.log(`[SERVER] Slot liberado: ${kartNum} na sala ${room.roomName}`);
+      console.log(`[SERVER] Sala atualizada: ${roomId} (${room.players.length}/${room.maxPlayers})`);
+
+      // Limpeza de leaderboard temporário, grid e finalistas
+      if (room.qualiLeaderboard) room.qualiLeaderboard.delete(socketId);
+      if (room.gridOrder) room.gridOrder = room.gridOrder.filter((g) => g.playerId !== socketId);
+      if (room.finishedPlayers) room.finishedPlayers = room.finishedPlayers.filter((f) => f.playerId !== socketId);
+
+      // DESTRUIÇÃO AUTOMÁTICA DE SALAS VAZIAS
+      if (room.players.length === 0) {
+        if (room.qualiInterval) clearInterval(room.qualiInterval);
+        delete rooms[roomId];
+        console.log(`[SALA] removida por falta de jogadores: ${roomId}`);
+      } else {
+        // TRANSFERÊNCIA DE HOST AUTOMÁTICA
+        if (room.hostId === socketId) {
+          const nextHost = room.players[0];
+          room.hostId = nextHost.playerId;
+          nextHost.isHost = true;
+          nextHost.isReady = true;
+          console.log(`[SERVER] Novo Host: ${nextHost.playerName} na sala ${room.roomName}`);
+          io.to(roomId).emit('hostTransferred', {
+            newHostId: nextHost.playerId,
+            newHostName: nextHost.playerName
+          });
+        }
+
+        io.to(roomId).emit('playerLeft', {
+          playerId: socketId,
+          playerName,
+          players: room.players
+        });
+        io.to(roomId).emit('roomConfigUpdated', { config: room.config, players: room.players });
+      }
+    }
+  }
+
+  // Remove da lista global de jogadores
+  delete players[socketId];
+
+  // Emite atualização autoritativa para TODOS os clientes em tempo real
+  const onlineCount = Object.keys(players).length;
+  io.emit('playerLeft', { playerId: socketId, playerName });
+  io.emit('playerDisconnected', socketId);
+  io.emit('playersUpdate', players);
+  io.emit('players', players);
+  io.emit('onlineCount', onlineCount);
+  io.emit('roomList', getPublicRooms());
+  io.emit('race:rooms_list', getPublicRooms());
+
+  printServerDiagnostics();
+}
+
+// LIMPEZA AUTOMÁTICA DE JOGADORES INATIVOS (A cada 30 segundos)
+// Remove jogadores sem comunicação há mais de 20 segundos
+setInterval(() => {
+  const now = Date.now();
+  const TIMEOUT_MS = 20000;
+  let expiredCount = 0;
+
+  for (const [socketId, p] of Object.entries(players)) {
+    const lastActive = p.lastActive || p.connectedAt || now;
+    const elapsed = now - lastActive;
+
+    if (elapsed > TIMEOUT_MS) {
+      console.log(`[SERVER] Jogador expirado por timeout: ${p.playerName} (${socketId}) - Inativo há ${(elapsed / 1000).toFixed(1)}s`);
+      const clientSocket = io.sockets.sockets.get(socketId);
+      if (clientSocket) {
+        try { clientSocket.disconnect(true); } catch (e) {}
+      }
+      removePlayerCompletely(socketId, 'timeout');
+      expiredCount++;
+    }
+  }
+
+  if (expiredCount > 0) {
+    printServerDiagnostics();
+  }
+}, 30000);
+
 // ==========================================
 // SOCKET.IO EVENTOS E SINCRONIZAÇÃO
 // ==========================================
 io.on('connection', (socket) => {
   console.log(`[SERVER] Cliente conectado: ${socket.id}`);
 
+  const now = Date.now();
   const numInt = allocateGlobalKartNumber();
   const kartNumberStr = `#${numInt}`;
 
@@ -346,9 +470,18 @@ io.on('connection', (socket) => {
     rotation: { heading: 0, steerAngle: 0 },
     speed: 0,
     currentLap: 1,
-    bestLap: null
+    bestLap: null,
+    lastActive: now,
+    connectedAt: now
   };
   players[socket.id] = playerObj;
+
+  // Intercepta qualquer evento para atualizar o heartbeat de atividade
+  socket.onAny(() => {
+    if (players[socket.id]) {
+      players[socket.id].lastActive = Date.now();
+    }
+  });
 
   console.log(`[SERVER] emit playerAssigned: ${socket.id} (${kartNumberStr})`);
   socket.emit('playerAssigned', playerObj);
@@ -357,6 +490,9 @@ io.on('connection', (socket) => {
   console.log(`[SERVER] emit playersUpdate: ${totalPlayers} pilotos online`);
   io.emit('playersUpdate', players);
   io.emit('players', players);
+  io.emit('onlineCount', totalPlayers);
+
+  printServerDiagnostics();
 
   const publicRooms = getPublicRooms();
   console.log(`[SERVER] emit roomList: ${publicRooms.length} salas`);
@@ -924,64 +1060,47 @@ io.on('connection', (socket) => {
   socket.on('race:state', handlePlayerState);
   socket.on('timetrial:state', handlePlayerState);
 
-  // 7. CHAT EM TEMPO REAL & CHAT RÁPIDO
+  // 7. CHAT EM TEMPO REAL (Máximo 120 caracteres, anti-spam, filtro de vazios)
   socket.on('chat:send', (data = {}) => {
     const pInfo = players[socket.id];
-    const rawMsg = String(data.message || '').trim().slice(0, 140);
-    if (!rawMsg) return;
+    const rawMsg = String(data.message || '').trim().slice(0, 120);
+    if (!rawMsg) return; // Impede envio de mensagens vazias
+
+    // Filtro anti-spam: limite de frequência e repetição
+    const now = Date.now();
+    if (pInfo) {
+      if (pInfo.lastChatTime && (now - pInfo.lastChatTime < 400)) {
+        return; // Taxa rápida ignorada
+      }
+      if (pInfo.lastChatMsg === rawMsg && (now - pInfo.lastChatTime < 2500)) {
+        return; // Duplicada consecutiva ignorada
+      }
+      pInfo.lastChatTime = now;
+      pInfo.lastChatMsg = rawMsg;
+    }
 
     const senderName = (pInfo && pInfo.playerName) || data.playerName || 'Piloto';
     const kartNum = (pInfo && pInfo.kartNumber) || '#1';
+    const isHost = Boolean(pInfo && pInfo.isHost);
 
     const chatMsg = {
       id: `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       senderName,
+      playerName: senderName,
+      playerId: socket.id,
       kartNumber: kartNum,
       message: rawMsg,
+      isHost,
       timestamp: Date.now()
     };
 
     globalChatHistory.push(chatMsg);
-    if (globalChatHistory.length > 50) globalChatHistory.shift();
+    if (globalChatHistory.length > 30) globalChatHistory.shift();
 
     if (pInfo && pInfo.roomId) {
       io.to(pInfo.roomId).emit('chat:message', chatMsg);
     } else {
       io.emit('chat:message', chatMsg);
-    }
-  });
-
-  socket.on('chat:quick', (data = {}) => {
-    const pInfo = players[socket.id];
-    const allowed = [
-      'Boa sorte!',
-      'Bela volta!',
-      'Obrigado!',
-      'Entrando nos boxes.',
-      'Parabéns!',
-      'Bela ultrapassagem!',
-      'Entrando nos boxes!'
-    ];
-    const msg = data.message;
-    if (!allowed.includes(msg)) return;
-
-    const senderName = (pInfo && pInfo.playerName) || data.playerName || 'Piloto';
-    const kartNum = (pInfo && pInfo.kartNumber) || '#1';
-
-    const chatMsg = {
-      id: `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      senderName,
-      kartNumber: kartNum,
-      message: msg,
-      timestamp: Date.now()
-    };
-
-    if (pInfo && pInfo.roomId) {
-      io.to(pInfo.roomId).emit('chat:message', chatMsg);
-      io.to(pInfo.roomId).emit('chat:quick_message', { senderName, message: msg });
-    } else {
-      io.emit('chat:message', chatMsg);
-      socket.broadcast.emit('chat:quick_message', { senderName, message: msg });
     }
   });
 
@@ -998,20 +1117,25 @@ io.on('connection', (socket) => {
         const leaving = room.players[idx];
         releaseRoomKartNumber(room, leaving.numberInt);
         room.players.splice(idx, 1);
-        room.qualiLeaderboard.delete(socket.id);
+        if (room.qualiLeaderboard) room.qualiLeaderboard.delete(socket.id);
+        if (room.gridOrder) room.gridOrder = room.gridOrder.filter((g) => g.playerId !== socket.id);
+        if (room.finishedPlayers) room.finishedPlayers = room.finishedPlayers.filter((f) => f.playerId !== socket.id);
 
         console.log(`[SERVER] Jogador saiu da sala: ${leaving.playerName} (${leaving.kartNumber})`);
+        console.log(`[SERVER] Slot liberado: ${leaving.kartNumber} na sala ${room.roomName}`);
+        console.log(`[SERVER] Sala atualizada: ${roomId} (${room.players.length}/${room.maxPlayers})`);
 
         if (room.players.length === 0) {
           if (room.qualiInterval) clearInterval(room.qualiInterval);
           delete rooms[roomId];
-          console.log(`[SERVER] Sala removida: ${roomId} (vazia)`);
+          console.log(`[SALA] removida por falta de jogadores: ${roomId}`);
         } else {
           if (room.hostId === socket.id) {
             const nextHost = room.players[0];
             room.hostId = nextHost.playerId;
             nextHost.isHost = true;
             nextHost.isReady = true;
+            console.log(`[SERVER] Novo Host: ${nextHost.playerName} na sala ${room.roomName}`);
             io.to(roomId).emit('hostTransferred', {
               newHostId: nextHost.playerId,
               newHostName: nextHost.playerName
@@ -1019,8 +1143,10 @@ io.on('connection', (socket) => {
           }
           io.to(roomId).emit('playerLeft', {
             playerId: socket.id,
+            playerName: leaving.playerName,
             players: room.players
           });
+          io.to(roomId).emit('roomConfigUpdated', { config: room.config, players: room.players });
         }
       }
     }
@@ -1031,22 +1157,18 @@ io.on('connection', (socket) => {
     io.emit('race:rooms_list', getPublicRooms());
     io.emit('playersUpdate', players);
     io.emit('players', players);
+    io.emit('onlineCount', Object.keys(players).length);
   };
   socket.on('leaveRoom', handleLeaveRoom);
   socket.on('race:leave', handleLeaveRoom);
 
-  // 9. DESCONEXÃO
-  socket.on('disconnect', () => {
-    console.log(`[SERVER] Cliente desconectado: ${socket.id}`);
-    handleLeaveRoom();
-    delete players[socket.id];
+  // 9. DESCONEXÃO (disconnecting e disconnect)
+  socket.on('disconnecting', () => {
+    removePlayerCompletely(socket.id, 'disconnecting / aba fechada');
+  });
 
-    const totalRemaining = Object.keys(players).length;
-    console.log(`[SERVER] emit playersUpdate: ${totalRemaining} pilotos online`);
-    io.emit('playersUpdate', players);
-    io.emit('players', players);
-    io.emit('playerLeft', { playerId: socket.id });
-    io.emit('playerDisconnected', socket.id);
+  socket.on('disconnect', () => {
+    removePlayerCompletely(socket.id, 'desconexão');
   });
 
   // Time Trial Online
