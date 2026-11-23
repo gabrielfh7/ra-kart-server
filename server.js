@@ -4,31 +4,29 @@
  * Compatível com Render.com, Cloudflare Pages e Node.js
  * URL Oficial: https://ra-kart-server.onrender.com
  * 
- * AUDITORIA E LOGS EXATOS DE SINCRONIZAÇÃO:
- *   [SERVER] Cliente conectado: <id>
- *   [SERVER] Cliente desconectado: <id>
- *   [SERVER] emit playerAssigned: <id> (<kartNumber>)
- *   [SERVER] emit playersUpdate: <total> pilotos online
- *   [SERVER] emit roomList: <total> salas
- *   [SERVER] createRoom recebido: <roomId> por <id>
- *   [SERVER] joinRoom recebido: <roomId> por <id>
- *   [SERVER] emit playerJoined: <id> (<kartNumber>) na sala <roomId>
- *   [SERVER] playerState recebido: <id> (<kartNumber>)
- *   [SERVER] emit playerState para: <destinatário>
- * 
- * ENDPOINTS HTTP:
- *   GET /       -> Health check status
- *   GET /debug  -> JSON com estado completo de players e rooms
+ * SISTEMAS COMPLETOS DE CAMPEONATO:
+ *   • Salas Configuráveis (Voltas, Clima, Colisão, Qualificação, Tempo Quali)
+ *   • Sessão de Qualificação (Cronômetro regressivo, voltas ilimitadas, melhor volta)
+ *   • Grid de Largada Sincronizado (P1 Pole, P2, P3...) com tela GRID DEFINIDO
+ *   • Contagem Regressiva Autoritativa do Servidor (3, 2, 1, GO)
+ *   • Telemetria & Colisão Multiplayer (Bounding Boxes com conservação de momento)
+ *   • Chat em Tempo Real (Histórico de 30 mensagens) + Chat Rápido
+ *   • Recordes Gerais Globais (Top 100 Persistente em disco)
+ *   • Estatísticas & Perfil do Piloto (Corridas, Vitórias, Poles, Pódios, Média)
+ *   • Endpoints REST: GET /debug, GET /api/records, POST /api/records, GET /api/statistics
  * ============================================================================
  */
 
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
+app.use(express.json());
 
-// Middleware CORS universal sem dependência externa
+// Middleware CORS universal
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', '*');
@@ -50,35 +48,214 @@ const io = new Server(server, {
 });
 
 // ==========================================
+// PERSISTÊNCIA EM DISCO (RECORDES & STATS)
+// ==========================================
+const DATA_DIR = path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  } catch (e) {}
+}
+
+const RECORDS_FILE = path.join(DATA_DIR, 'records.json');
+const STATS_FILE = path.join(DATA_DIR, 'statistics.json');
+
+function loadPersistentRecords() {
+  try {
+    if (fs.existsSync(RECORDS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(RECORDS_FILE, 'utf8'));
+      if (Array.isArray(data)) return data;
+    }
+  } catch (e) {
+    console.warn('[SERVER] Erro ao carregar records.json:', e.message);
+  }
+  return [
+    { nome: 'Gabriel', peso: 80, melhorVolta: 21840, data: '22/11/2026', modo: 'ONLINE' },
+    { nome: 'Piloto Pro', peso: 75, melhorVolta: 22105, data: '22/11/2026', modo: 'ONLINE' },
+    { nome: 'Indoor Master', peso: 82, melhorVolta: 22450, data: '22/11/2026', modo: 'ONLINE' }
+  ];
+}
+
+function savePersistentRecords(records) {
+  try {
+    fs.writeFileSync(RECORDS_FILE, JSON.stringify(records, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('[SERVER] Erro ao salvar records.json:', e.message);
+  }
+}
+
+function loadPersistentStats() {
+  try {
+    if (fs.existsSync(STATS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+      if (typeof data === 'object' && data !== null) return data;
+    }
+  } catch (e) {
+    console.warn('[SERVER] Erro ao carregar statistics.json:', e.message);
+  }
+  return {};
+}
+
+function savePersistentStats(stats) {
+  try {
+    fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('[SERVER] Erro ao salvar statistics.json:', e.message);
+  }
+}
+
+const globalRecords = loadPersistentRecords();
+const globalStatistics = loadPersistentStats();
+const globalChatHistory = []; // últimas 30 mensagens
+
+// ==========================================
 // ESTADO EM MEMÓRIA CENTRAL DO SERVIDOR
 // ==========================================
 const rooms = {};
 const players = {};
 
-// 1. ENDPOINT DE HEALTH CHECK
+// 1. ENDPOINT HEALTH CHECK
 app.get('/', (req, res) => {
   res.json({
     status: 'ONLINE',
     game: 'RA Kart Indoor Simulator',
     serverTime: new Date().toISOString(),
     playerCount: Object.keys(players).length,
-    roomCount: Object.keys(rooms).length
+    roomCount: Object.keys(rooms).length,
+    topRecord: globalRecords.length > 0 ? globalRecords[0] : null
   });
 });
 
-// 2. ENDPOINT TEMPORÁRIO DE DIAGNÓSTICO E AUDITORIA (GET /debug)
+// 2. ENDPOINT DE DIAGNÓSTICO E AUDITORIA (GET /debug)
 app.get('/debug', (req, res) => {
   res.json({
     playerCount: Object.keys(players).length,
     roomCount: Object.keys(rooms).length,
     players,
     rooms,
+    chatHistoryCount: globalChatHistory.length,
+    recordsCount: globalRecords.length,
     timestamp: new Date().toISOString()
   });
 });
 
+// 3. ENDPOINTS REST: RECORDES GERAIS (TOP 100 GLOBAL)
+app.get('/api/records', (req, res) => {
+  const top100 = globalRecords.slice(0, 100);
+  res.json(top100);
+});
+
+app.post('/api/records', (req, res) => {
+  const { nome, peso, melhorVolta, modo } = req.body || {};
+  if (!melhorVolta || typeof melhorVolta !== 'number' || melhorVolta < 15000 || melhorVolta > 99999) {
+    return res.status(400).json({ error: 'Tempo de volta inválido.' });
+  }
+
+  const newEntry = {
+    nome: String(nome || 'Piloto').slice(0, 22).trim(),
+    peso: Math.max(40, Math.min(150, Number(peso) || 80)),
+    melhorVolta: Math.round(melhorVolta),
+    data: new Date().toLocaleDateString('pt-BR'),
+    modo: String(modo || 'ONLINE').slice(0, 20)
+  };
+
+  globalRecords.push(newEntry);
+  globalRecords.sort((a, b) => a.melhorVolta - b.melhorVolta);
+
+  if (globalRecords.length > 100) {
+    globalRecords.length = 100;
+  }
+  savePersistentRecords(globalRecords);
+
+  res.json({ success: true, record: newEntry, rank: globalRecords.indexOf(newEntry) + 1 });
+});
+
+// 4. ENDPOINTS REST: ESTATÍSTICAS E PERFIL DO PILOTO
+app.get('/api/statistics', (req, res) => {
+  const list = Object.values(globalStatistics).map((st) => {
+    const finishes = st.finishPositions || [];
+    const avgPos = finishes.length > 0
+      ? (finishes.reduce((acc, v) => acc + v, 0) / finishes.length).toFixed(1)
+      : '-';
+    return {
+      nome: st.nome,
+      races: st.races || 0,
+      wins: st.wins || 0,
+      poles: st.poles || 0,
+      podiums: st.podiums || 0,
+      bestLap: st.bestLap || null,
+      avgPosition: avgPos
+    };
+  });
+  list.sort((a, b) => b.wins - a.wins || b.podiums - a.podiums);
+  res.json(list);
+});
+
+app.get('/api/profile/:name', (req, res) => {
+  const name = req.params.name;
+  const profile = globalStatistics[name] || {
+    nome: name,
+    races: 0,
+    wins: 0,
+    poles: 0,
+    podiums: 0,
+    bestLap: null,
+    finishPositions: [],
+    history: []
+  };
+  res.json(profile);
+});
+
 /**
- * Retorna lista formatada de salas ativas
+ * Registra resultado de corrida nas estatísticas
+ */
+function recordRaceStatistics(results, poleWinnerName) {
+  results.forEach((entry, idx) => {
+    const pName = entry.playerName || entry.nome || 'Piloto';
+    const finishPos = idx + 1;
+
+    if (!globalStatistics[pName]) {
+      globalStatistics[pName] = {
+        nome: pName,
+        races: 0,
+        wins: 0,
+        poles: 0,
+        podiums: 0,
+        bestLap: null,
+        finishPositions: [],
+        history: []
+      };
+    }
+
+    const st = globalStatistics[pName];
+    st.races = (st.races || 0) + 1;
+    if (finishPos === 1) st.wins = (st.wins || 0) + 1;
+    if (finishPos <= 3) st.podiums = (st.podiums || 0) + 1;
+    if (poleWinnerName && poleWinnerName === pName) st.poles = (st.poles || 0) + 1;
+
+    if (entry.bestLapMs && (!st.bestLap || entry.bestLapMs < st.bestLap)) {
+      st.bestLap = entry.bestLapMs;
+    }
+
+    if (!st.finishPositions) st.finishPositions = [];
+    st.finishPositions.push(finishPos);
+    if (st.finishPositions.length > 50) st.finishPositions.shift();
+
+    if (!st.history) st.history = [];
+    st.history.unshift({
+      date: new Date().toLocaleDateString('pt-BR'),
+      position: finishPos,
+      totalDrivers: results.length,
+      bestLapMs: entry.bestLapMs || null
+    });
+    if (st.history.length > 20) st.history.pop();
+  });
+
+  savePersistentStats(globalStatistics);
+}
+
+/**
+ * Retorna lista de salas ativas
  */
 function getPublicRooms() {
   return Object.values(rooms).map((r) => {
@@ -92,8 +269,14 @@ function getPublicRooms() {
       hostName: host ? host.playerName : 'Piloto',
       playerCount: r.players.length,
       maxPlayers: r.maxPlayers,
+      totalLaps: r.config ? r.config.totalLaps : 5,
+      weather: r.config ? r.config.weather : 'indoor',
+      collisionEnabled: r.config ? r.config.collisionEnabled : true,
+      hasQualifying: r.config ? r.config.hasQualifying : false,
+      qualifyingMinutes: r.config ? r.config.qualifyingMinutes : 3,
       hasPassword: Boolean(r.password),
       status: r.status,
+      config: r.config,
       players: r.players.map((p) => ({
         playerId: p.playerId,
         id: p.playerId,
@@ -107,9 +290,6 @@ function getPublicRooms() {
   });
 }
 
-/**
- * Aloca o próximo número único global (#1 a #5)
- */
 function allocateGlobalKartNumber() {
   const used = new Set(Object.values(players).map((p) => p.numberInt).filter(Boolean));
   for (let i = 1; i <= 5; i++) {
@@ -118,9 +298,6 @@ function allocateGlobalKartNumber() {
   return Object.keys(players).length + 1;
 }
 
-/**
- * Aloca o próximo número de kart dentro de uma sala (#1 para host, #2 a #5 para os demais)
- */
 function allocateRoomKartNumber(room, isHost = false) {
   if (isHost && !room.usedNumbers.includes(1)) {
     room.usedNumbers.push(1);
@@ -147,12 +324,11 @@ function releaseRoomKartNumber(room, numInt) {
 }
 
 // ==========================================
-// CICLO DE CONEXÃO SOCKET.IO
+// SOCKET.IO EVENTOS E SINCRONIZAÇÃO
 // ==========================================
 io.on('connection', (socket) => {
   console.log(`[SERVER] Cliente conectado: ${socket.id}`);
 
-  // Atribuição de número autoritativo único do servidor
   const numInt = allocateGlobalKartNumber();
   const kartNumberStr = `#${numInt}`;
 
@@ -177,24 +353,25 @@ io.on('connection', (socket) => {
   console.log(`[SERVER] emit playerAssigned: ${socket.id} (${kartNumberStr})`);
   socket.emit('playerAssigned', playerObj);
 
-  // Transmissão da lista atualizada de jogadores para todos os clientes
   const totalPlayers = Object.keys(players).length;
   console.log(`[SERVER] emit playersUpdate: ${totalPlayers} pilotos online`);
   io.emit('playersUpdate', players);
-  io.emit('players', players); // compatibilidade retroativa
+  io.emit('players', players);
 
-  // Envio imediato da lista de salas
   const publicRooms = getPublicRooms();
   console.log(`[SERVER] emit roomList: ${publicRooms.length} salas`);
   socket.emit('roomList', publicRooms);
   socket.emit('race:rooms_list', publicRooms);
+
+  // Envia histórico de chat recente
+  socket.emit('chat:history', globalChatHistory.slice(-30));
 
   // Ping / Latência
   socket.on('client:ping', (timestamp) => {
     socket.emit('server:pong', timestamp);
   });
 
-  // Atualização de perfil do piloto
+  // Atualização de perfil
   socket.on('updatePlayerProfile', (data) => {
     if (players[socket.id] && data) {
       if (data.playerName) {
@@ -208,7 +385,6 @@ io.on('connection', (socket) => {
   // 1. SOLICITAÇÃO DE SALAS
   const sendRoomList = () => {
     const list = getPublicRooms();
-    console.log(`[SERVER] emit roomList: ${list.length} salas para ${socket.id}`);
     socket.emit('roomList', list);
     socket.emit('race:rooms_list', list);
   };
@@ -217,16 +393,32 @@ io.on('connection', (socket) => {
   socket.on('roomList', sendRoomList);
   socket.on('race:list_rooms', sendRoomList);
 
-  // 2. CRIAR SALA (createRoom)
+  // 2. CRIAR SALA (createRoom com CONFIGURAÇÃO COMPLETA)
   const handleCreateRoom = (data = {}) => {
     const playerName = (data.playerName || players[socket.id].playerName || 'Piloto').slice(0, 22).trim();
     const rawName = (data.roomName || data.name || `RA-KART-${Math.floor(100 + Math.random() * 900)}`).slice(0, 26).trim();
     const maxPlayers = Math.min(5, Math.max(2, parseInt(data.maxPlayers, 10) || 5));
+    const totalLaps = [1, 3, 5, 10, 15, 20].includes(Number(data.totalLaps)) ? Number(data.totalLaps) : 5;
+    const weather = ['indoor', 'indoor_night', 'indoor_dim'].includes(data.weather) ? data.weather : 'indoor';
+    const collisionEnabled = data.collisionEnabled !== false;
+    const hasQualifying = Boolean(data.hasQualifying);
+    const qualifyingMinutes = [1, 3, 5, 10].includes(Number(data.qualifyingMinutes)) ? Number(data.qualifyingMinutes) : 3;
     const password = (data.password || '').trim();
     const kartWeight = Math.min(150, Math.max(40, Number(data.kartWeight) || 80));
 
     const roomId = `RA-KART-${Math.floor(100 + Math.random() * 900)}`;
     console.log(`[SERVER] createRoom recebido: ${roomId} por ${socket.id} (${playerName})`);
+
+    const roomConfig = {
+      roomName: rawName,
+      maxPlayers,
+      totalLaps,
+      weather,
+      collisionEnabled,
+      hasQualifying,
+      qualifyingMinutes,
+      password
+    };
 
     const room = {
       roomId,
@@ -234,12 +426,17 @@ io.on('connection', (socket) => {
       hostId: socket.id,
       maxPlayers,
       password,
+      config: roomConfig,
       status: 'WAITING',
       players: [],
-      usedNumbers: []
+      usedNumbers: [],
+      chatMessages: [],
+      qualiLeaderboard: new Map(),
+      qualiTimeRemaining: 0,
+      gridOrder: [],
+      finishedPlayers: []
     };
 
-    // Host da sala recebe #1
     const hostNumberInt = allocateRoomKartNumber(room, true);
     const hostNumberStr = `#${hostNumberInt}`;
 
@@ -279,6 +476,7 @@ io.on('connection', (socket) => {
       isHost: true,
       myKartNumber: hostNumberStr,
       kartNumber: hostNumberStr,
+      config: roomConfig,
       players: room.players
     };
 
@@ -286,16 +484,45 @@ io.on('connection', (socket) => {
     socket.emit('race:room_created', { room: roomPayload });
 
     const updatedRooms = getPublicRooms();
-    console.log(`[SERVER] emit roomList: ${updatedRooms.length} salas`);
     io.emit('roomList', updatedRooms);
     io.emit('race:rooms_list', updatedRooms);
-
-    console.log(`[SERVER] emit playersUpdate: ${Object.keys(players).length} pilotos`);
     io.emit('playersUpdate', players);
     io.emit('players', players);
   };
   socket.on('createRoom', handleCreateRoom);
   socket.on('race:create_room', handleCreateRoom);
+
+  // 2.1 ATUALIZAÇÃO DE CONFIGURAÇÃO DA SALA PELO HOST
+  socket.on('room:update_config', (newConfig = {}) => {
+    const pInfo = players[socket.id];
+    if (!pInfo || !pInfo.roomId) return;
+    const room = rooms[pInfo.roomId];
+    if (!room || room.hostId !== socket.id) return;
+
+    if (newConfig.totalLaps && [1, 3, 5, 10, 15, 20].includes(Number(newConfig.totalLaps))) {
+      room.config.totalLaps = Number(newConfig.totalLaps);
+    }
+    if (newConfig.weather && ['indoor', 'indoor_night', 'indoor_dim'].includes(newConfig.weather)) {
+      room.config.weather = newConfig.weather;
+    }
+    if (typeof newConfig.collisionEnabled === 'boolean') {
+      room.config.collisionEnabled = newConfig.collisionEnabled;
+    }
+    if (typeof newConfig.hasQualifying === 'boolean') {
+      room.config.hasQualifying = newConfig.hasQualifying;
+    }
+    if (newConfig.qualifyingMinutes && [1, 3, 5, 10].includes(Number(newConfig.qualifyingMinutes))) {
+      room.config.qualifyingMinutes = Number(newConfig.qualifyingMinutes);
+    }
+
+    console.log(`[SERVER] Configuração da sala ${room.roomId} atualizada pelo Host:`, room.config);
+
+    io.to(room.roomId).emit('roomConfigUpdated', {
+      roomId: room.roomId,
+      config: room.config
+    });
+    io.emit('roomList', getPublicRooms());
+  });
 
   // 3. ENTRAR EM SALA (joinRoom)
   const handleJoinRoom = (data = {}) => {
@@ -312,7 +539,7 @@ io.on('connection', (socket) => {
       return;
     }
     if (room.status !== 'WAITING') {
-      socket.emit('roomError', { message: 'A corrida já foi iniciada nesta sala.' });
+      socket.emit('roomError', { message: 'A sessão já foi iniciada nesta sala.' });
       return;
     }
     if (room.players.length >= room.maxPlayers) {
@@ -324,7 +551,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Atribui número exclusivo (#2, #3, #4, #5 sem repetição)
     const assignedNumberInt = allocateRoomKartNumber(room, false);
     const assignedNumberStr = `#${assignedNumberInt}`;
 
@@ -362,6 +588,7 @@ io.on('connection', (socket) => {
       isHost: false,
       myKartNumber: assignedNumberStr,
       kartNumber: assignedNumberStr,
+      config: room.config,
       players: room.players
     };
 
@@ -400,8 +627,8 @@ io.on('connection', (socket) => {
     io.to(room.roomId).emit('playerReady', payload);
   });
 
-  // 5. INICIAR CORRIDA (startRace)
-  const handleStartRace = () => {
+  // 5. INICIAR SESSÃO: QUALIFICAÇÃO OU CORRIDA DIRETA
+  const handleStartSession = () => {
     const pInfo = players[socket.id];
     if (!pInfo || !pInfo.roomId) return;
     const room = rooms[pInfo.roomId];
@@ -418,25 +645,248 @@ io.on('connection', (socket) => {
       return;
     }
 
-    room.status = 'RACING';
-    console.log(`[SERVER] Corrida iniciada na sala: ${room.roomName}!`);
+    // Se a sala tem qualificação ativada: inicia sessão de quali
+    if (room.config && room.config.hasQualifying) {
+      room.status = 'QUALIFYING';
+      const durationSeconds = (room.config.qualifyingMinutes || 3) * 60;
+      room.qualiTimeRemaining = durationSeconds;
+      room.qualiLeaderboard = new Map();
 
-    const startPayload = {
-      roomId: room.roomId,
-      roomName: room.roomName,
-      players: room.players,
-      countdown: 3
-    };
+      console.log(`[SERVER] Qualificação iniciada na sala ${room.roomName}! Duração: ${durationSeconds}s`);
 
-    io.to(room.roomId).emit('raceStarted', startPayload);
-    io.to(room.roomId).emit('raceStart', startPayload);
+      io.to(room.roomId).emit('qualifyingStarted', {
+        roomId: room.roomId,
+        roomName: room.roomName,
+        durationSeconds,
+        config: room.config,
+        players: room.players
+      });
+
+      if (room.qualiInterval) clearInterval(room.qualiInterval);
+      room.qualiInterval = setInterval(() => {
+        room.qualiTimeRemaining -= 1;
+        io.to(room.roomId).emit('qualifyingTick', {
+          remainingSeconds: Math.max(0, room.qualiTimeRemaining)
+        });
+
+        if (room.qualiTimeRemaining <= 0) {
+          clearInterval(room.qualiInterval);
+          finishQualifyingSession(room);
+        }
+      }, 1000);
+    } else {
+      // Sem quali: gera grid direto
+      setupAndStartRace(room);
+    }
 
     io.emit('roomList', getPublicRooms());
-    io.emit('race:rooms_list', getPublicRooms());
   };
-  socket.on('startRace', handleStartRace);
-  socket.on('raceStart', handleStartRace);
-  socket.on('race:start_countdown', handleStartRace);
+  socket.on('startRace', handleStartSession);
+  socket.on('raceStart', handleStartSession);
+  socket.on('race:start_countdown', handleStartSession);
+
+  // 5.1 ENVIO DE VOLTA DE QUALIFICAÇÃO OU CORRIDA (session:lap_time)
+  socket.on('session:lap_time', (data = {}) => {
+    const pInfo = players[socket.id];
+    if (!pInfo || !pInfo.roomId) return;
+    const room = rooms[pInfo.roomId];
+    if (!room) return;
+
+    const lapMs = Math.round(Number(data.lapTimeMs) || 0);
+    const isValid = Boolean(data.isValid);
+
+    if (isValid && lapMs > 15000 && lapMs < 120000) {
+      if (room.status === 'QUALIFYING') {
+        const existing = room.qualiLeaderboard.get(socket.id);
+        if (!existing || lapMs < existing.bestLapMs) {
+          room.qualiLeaderboard.set(socket.id, {
+            playerId: socket.id,
+            playerName: pInfo.playerName,
+            kartNumber: pInfo.kartNumber,
+            bestLapMs: lapMs
+          });
+
+          // Transmite leaderboard da quali ordenado
+          const sortedQuali = Array.from(room.qualiLeaderboard.values()).sort(
+            (a, b) => a.bestLapMs - b.bestLapMs
+          );
+          io.to(room.roomId).emit('qualifyingLeaderboard', sortedQuali);
+        }
+      }
+
+      // Registra recorde geral no Top 100 Global
+      if (lapMs <= 26000) {
+        const rec = {
+          nome: pInfo.playerName,
+          peso: pInfo.kartWeight || 80,
+          melhorVolta: lapMs,
+          data: new Date().toLocaleDateString('pt-BR'),
+          modo: room.status === 'QUALIFYING' ? 'QUALIFICAÇÃO' : 'CORRIDA'
+        };
+        globalRecords.push(rec);
+        globalRecords.sort((a, b) => a.melhorVolta - b.melhorVolta);
+        if (globalRecords.length > 100) globalRecords.length = 100;
+        savePersistentRecords(globalRecords);
+      }
+    }
+  });
+
+  // Finaliza a sessão de qualificação e monta o grid
+  function finishQualifyingSession(room) {
+    if (room.qualiInterval) clearInterval(room.qualiInterval);
+    room.status = 'GRID_DEFINED';
+
+    const ranked = Array.from(room.qualiLeaderboard.values()).sort(
+      (a, b) => a.bestLapMs - b.bestLapMs
+    );
+
+    // Pilotos que não completaram volta válida ficam nas posições finais
+    const unranked = room.players.filter(
+      (p) => !ranked.some((r) => r.playerId === p.playerId)
+    );
+
+    const finalGrid = [];
+    ranked.forEach((r, idx) => {
+      finalGrid.push({
+        positionLabel: `P${idx + 1}`,
+        position: idx + 1,
+        playerId: r.playerId,
+        playerName: r.playerName,
+        kartNumber: r.kartNumber,
+        bestLapMs: r.bestLapMs
+      });
+    });
+
+    unranked.forEach((u, idx) => {
+      const pos = ranked.length + idx + 1;
+      finalGrid.push({
+        positionLabel: `P${pos}`,
+        position: pos,
+        playerId: u.playerId,
+        playerName: u.playerName,
+        kartNumber: u.kartNumber,
+        bestLapMs: null
+      });
+    });
+
+    room.gridOrder = finalGrid;
+    console.log(`[SERVER] GRID DEFINIDO na sala ${room.roomName}:`, finalGrid);
+
+    io.to(room.roomId).emit('gridDefined', {
+      roomId: room.roomId,
+      roomName: room.roomName,
+      grid: finalGrid,
+      config: room.config
+    });
+
+    // Registra Pole Position nas estatísticas
+    if (finalGrid.length > 0 && finalGrid[0].bestLapMs) {
+      const poleDriver = finalGrid[0].playerName;
+      if (globalStatistics[poleDriver]) {
+        globalStatistics[poleDriver].poles = (globalStatistics[poleDriver].poles || 0) + 1;
+        savePersistentStats(globalStatistics);
+      }
+    }
+  }
+
+  // 5.2 DISPARAR CORRIDA A PARTIR DO GRID DEFINIDO
+  socket.on('startRaceFromGrid', () => {
+    const pInfo = players[socket.id];
+    if (!pInfo || !pInfo.roomId) return;
+    const room = rooms[pInfo.roomId];
+    if (!room || room.hostId !== socket.id) return;
+    setupAndStartRace(room);
+  });
+
+  function setupAndStartRace(room) {
+    room.status = 'COUNTDOWN';
+    console.log(`[SERVER] Iniciando contagem regressiva sincronizada na sala ${room.roomName}!`);
+
+    // Atribui posições de largada conforme grid
+    if (!room.gridOrder || room.gridOrder.length === 0) {
+      room.gridOrder = room.players.map((p, idx) => ({
+        positionLabel: `P${idx + 1}`,
+        position: idx + 1,
+        playerId: p.playerId,
+        playerName: p.playerName,
+        kartNumber: p.kartNumber,
+        bestLapMs: null
+      }));
+    }
+
+    io.to(room.roomId).emit('racePreGrid', {
+      roomId: room.roomId,
+      grid: room.gridOrder,
+      config: room.config
+    });
+
+    // Contagem Regressiva Autoritativa Sincronizada: 3 -> 2 -> 1 -> GO!
+    const countdownSteps = [
+      { delay: 400, count: 3, text: '3' },
+      { delay: 1400, count: 2, text: '2' },
+      { delay: 2400, count: 1, text: '1' },
+      { delay: 3400, count: 0, text: 'GO!' }
+    ];
+
+    countdownSteps.forEach((step) => {
+      setTimeout(() => {
+        io.to(room.roomId).emit('raceCountdownTick', {
+          count: step.count,
+          text: step.text
+        });
+
+        if (step.count === 0) {
+          room.status = 'RACING';
+          room.finishedPlayers = [];
+          io.to(room.roomId).emit('raceStarted', {
+            roomId: room.roomId,
+            roomName: room.roomName,
+            config: room.config,
+            grid: room.gridOrder
+          });
+        }
+      }, step.delay);
+    });
+  }
+
+  // 5.3 CONCLUSÃO DA CORRIDA E BANDEIRADA
+  socket.on('race:player_finish', (data = {}) => {
+    const pInfo = players[socket.id];
+    if (!pInfo || !pInfo.roomId) return;
+    const room = rooms[pInfo.roomId];
+    if (!room || room.status !== 'RACING') return;
+
+    if (!room.finishedPlayers.some((p) => p.playerId === socket.id)) {
+      const finishPos = room.finishedPlayers.length + 1;
+      const finishEntry = {
+        position: finishPos,
+        playerId: socket.id,
+        playerName: pInfo.playerName,
+        kartNumber: pInfo.kartNumber,
+        bestLapMs: data.bestLapMs || null,
+        totalTimeMs: data.totalTimeMs || null
+      };
+      room.finishedPlayers.push(finishEntry);
+
+      console.log(`[SERVER] Piloto completou a corrida: ${finishPos}º ${pInfo.playerName}`);
+
+      io.to(room.roomId).emit('playerFinishedRace', finishEntry);
+
+      // Se todos completaram, finaliza a corrida e atualiza estatísticas
+      if (room.finishedPlayers.length >= room.players.length) {
+        room.status = 'FINISHED';
+        console.log(`[SERVER] Corrida finalizada na sala ${room.roomName}!`);
+
+        const poleWinner = (room.gridOrder && room.gridOrder[0]) ? room.gridOrder[0].playerName : null;
+        recordRaceStatistics(room.finishedPlayers, poleWinner);
+
+        io.to(room.roomId).emit('raceAllFinished', {
+          roomId: room.roomId,
+          results: room.finishedPlayers
+        });
+      }
+    }
+  });
 
   // 6. SINCRONIZAÇÃO DE TELEMETRIA (playerState / playerUpdate a 20 Hz)
   const handlePlayerState = (state = {}) => {
@@ -444,8 +894,6 @@ io.on('connection', (socket) => {
     if (!pInfo) return;
 
     const kartNum = pInfo.kartNumber || state.kartNumber || '#1';
-    console.log(`[SERVER] playerState recebido: ${socket.id} (${kartNum})`);
-
     state.id = socket.id;
     state.playerId = socket.id;
     state.socketId = socket.id;
@@ -464,11 +912,9 @@ io.on('connection', (socket) => {
       if (regPlayer) {
         Object.assign(regPlayer, state);
       }
-      console.log(`[SERVER] emit playerState para sala: ${pInfo.roomId}`);
       socket.to(room.roomId).emit('playerState', state);
       socket.to(room.roomId).emit('playerUpdate', state);
     } else {
-      console.log(`[SERVER] emit playerState para broadcast`);
       socket.broadcast.emit('playerState', state);
       socket.broadcast.emit('playerUpdate', state);
     }
@@ -478,7 +924,68 @@ io.on('connection', (socket) => {
   socket.on('race:state', handlePlayerState);
   socket.on('timetrial:state', handlePlayerState);
 
-  // 7. SAÍDA DE SALA (leaveRoom)
+  // 7. CHAT EM TEMPO REAL & CHAT RÁPIDO
+  socket.on('chat:send', (data = {}) => {
+    const pInfo = players[socket.id];
+    const rawMsg = String(data.message || '').trim().slice(0, 140);
+    if (!rawMsg) return;
+
+    const senderName = (pInfo && pInfo.playerName) || data.playerName || 'Piloto';
+    const kartNum = (pInfo && pInfo.kartNumber) || '#1';
+
+    const chatMsg = {
+      id: `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      senderName,
+      kartNumber: kartNum,
+      message: rawMsg,
+      timestamp: Date.now()
+    };
+
+    globalChatHistory.push(chatMsg);
+    if (globalChatHistory.length > 50) globalChatHistory.shift();
+
+    if (pInfo && pInfo.roomId) {
+      io.to(pInfo.roomId).emit('chat:message', chatMsg);
+    } else {
+      io.emit('chat:message', chatMsg);
+    }
+  });
+
+  socket.on('chat:quick', (data = {}) => {
+    const pInfo = players[socket.id];
+    const allowed = [
+      'Boa sorte!',
+      'Bela volta!',
+      'Obrigado!',
+      'Entrando nos boxes.',
+      'Parabéns!',
+      'Bela ultrapassagem!',
+      'Entrando nos boxes!'
+    ];
+    const msg = data.message;
+    if (!allowed.includes(msg)) return;
+
+    const senderName = (pInfo && pInfo.playerName) || data.playerName || 'Piloto';
+    const kartNum = (pInfo && pInfo.kartNumber) || '#1';
+
+    const chatMsg = {
+      id: `${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      senderName,
+      kartNumber: kartNum,
+      message: msg,
+      timestamp: Date.now()
+    };
+
+    if (pInfo && pInfo.roomId) {
+      io.to(pInfo.roomId).emit('chat:message', chatMsg);
+      io.to(pInfo.roomId).emit('chat:quick_message', { senderName, message: msg });
+    } else {
+      io.emit('chat:message', chatMsg);
+      socket.broadcast.emit('chat:quick_message', { senderName, message: msg });
+    }
+  });
+
+  // 8. SAÍDA DE SALA (leaveRoom)
   const handleLeaveRoom = () => {
     const pInfo = players[socket.id];
     if (!pInfo || !pInfo.roomId) return;
@@ -491,10 +998,12 @@ io.on('connection', (socket) => {
         const leaving = room.players[idx];
         releaseRoomKartNumber(room, leaving.numberInt);
         room.players.splice(idx, 1);
+        room.qualiLeaderboard.delete(socket.id);
 
         console.log(`[SERVER] Jogador saiu da sala: ${leaving.playerName} (${leaving.kartNumber})`);
 
         if (room.players.length === 0) {
+          if (room.qualiInterval) clearInterval(room.qualiInterval);
           delete rooms[roomId];
           console.log(`[SERVER] Sala removida: ${roomId} (vazia)`);
         } else {
@@ -526,10 +1035,9 @@ io.on('connection', (socket) => {
   socket.on('leaveRoom', handleLeaveRoom);
   socket.on('race:leave', handleLeaveRoom);
 
-  // 8. DESCONEXÃO
+  // 9. DESCONEXÃO
   socket.on('disconnect', () => {
     console.log(`[SERVER] Cliente desconectado: ${socket.id}`);
-
     handleLeaveRoom();
     delete players[socket.id];
 
@@ -552,32 +1060,30 @@ io.on('connection', (socket) => {
     }
   });
 
-  socket.on('timetrial:leave', () => {
-    io.emit('playersUpdate', players);
-    io.emit('players', players);
-  });
-
   socket.on('timetrial:lap_record', (data) => {
     const pInfo = players[socket.id];
     if (pInfo && data && data.bestLap) {
-      pInfo.bestLap = data.bestLap;
+      const bestLap = Math.round(data.bestLap);
+      pInfo.bestLap = bestLap;
       io.emit('timetrial:leaderboard_update', {
         playerId: socket.id,
         playerName: pInfo.playerName,
-        bestLap: data.bestLap
+        bestLap
       });
-    }
-  });
 
-  // Chat rápido
-  socket.on('chat:quick', (data) => {
-    const pInfo = players[socket.id];
-    const senderName = (pInfo && pInfo.playerName) || data.playerName || 'Piloto';
-    const message = data.message || '';
-    if (pInfo && pInfo.roomId) {
-      io.to(pInfo.roomId).emit('chat:quick_message', { senderName, message });
-    } else {
-      socket.broadcast.emit('chat:quick_message', { senderName, message });
+      if (bestLap > 15000 && bestLap <= 26000) {
+        const rec = {
+          nome: pInfo.playerName,
+          peso: pInfo.kartWeight || 80,
+          melhorVolta: bestLap,
+          data: new Date().toLocaleDateString('pt-BR'),
+          modo: 'TIME TRIAL ONLINE'
+        };
+        globalRecords.push(rec);
+        globalRecords.sort((a, b) => a.melhorVolta - b.melhorVolta);
+        if (globalRecords.length > 100) globalRecords.length = 100;
+        savePersistentRecords(globalRecords);
+      }
     }
   });
 });
@@ -587,5 +1093,6 @@ server.listen(PORT, () => {
   console.log(`====================================================`);
   console.log(`[SERVER] RA Kart Indoor Multiplayer Ativo na porta ${PORT}`);
   console.log(`[SERVER] URL Oficial: https://ra-kart-server.onrender.com`);
+  console.log(`[SERVER] Top Recordes Carregados: ${globalRecords.length}`);
   console.log(`====================================================`);
 });
